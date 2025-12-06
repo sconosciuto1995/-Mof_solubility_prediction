@@ -10,7 +10,7 @@ def init_weights(m):
                 torch.nn.init.xavier_uniform(m.weight)
                 m.bias.data.fill_(0.01)
 class BaseGNN(nn.Module):
-    def __init__(self,
+    def __init__(self, conv_layers
     nodefeat_num=3, edgefeat_num=2,
     nodeembed_to=3, edgeembed_to=2):
         super().__init__()
@@ -19,7 +19,7 @@ class BaseGNN(nn.Module):
         self._node_embednorm = nn.BatchNorm1d(nodeembed_to) 
         self._edge_embedding = nn.Sequential(nn.Linear(edgefeat_num, edgeembed_to), nn.ReLU())
         self._edge_embednorm = nn.BatchNorm1d(edgeembed_to)
-        
+        self.conv_layers = conv_layers
         # Graph Convolutions
         self._first_conv_ligand = NNConv(
             nodeembed_to, # first, pass the initial size of the nodes
@@ -117,12 +117,13 @@ class BaseGNN(nn.Module):
             self._edge_embedding(edge_features))
 
         # do graphs convolutions 
-        node_features =self._first_conv_batchnorm(self._first_conv(
-            node_features, edges, edge_features))
-        node_features =self._second_conv_batchnorm(self._second_conv(
-            node_features, edges, edge_features))
+        # node_features =self._first_conv_batchnorm(self._first_conv(
+        #     node_features, edges, edge_features))
+        # node_features =self._second_conv_batchnorm(self._second_conv(
+        #     node_features, edges, edge_features))
 
-
+        for layer in self.conv_layers:
+            node_features = layer(node_features, edges, edge_features)
         ## now, do the pooling
         pooled_graph_nodes = torch.cat([p(node_features, batch_vector) for p in self._pooling], axis=1) 
         ## now pass the pooled representation of the graph through a Neural Network. (Pooled representation is the shape size 
