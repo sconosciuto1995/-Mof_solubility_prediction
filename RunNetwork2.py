@@ -14,13 +14,13 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # Charger un exemple de triplet (remplacer par le chargement complet du dataset)
 current_dir = os.getcwd()
-datafile_anions = current_dir + '/mof_solubility/anions/ClO4.csv'
+datafile_anions = current_dir + '/anions/ClO4.csv'
 atoms_anions_list, atoms_anions_pos_list = extract_elements_and_positions(datafile_anions)
 
-datafile_ligand = current_dir + '/mof_solubility/ligand/xyz/Ag_Pillarplex-Br.xyz'
+datafile_ligand = current_dir + '/ligand/xyz/Ag_Pillarplex-Br.xyz'
 atoms_ligand_list, atom_ligand_pos_list = extract_last_snapshot(datafile_ligand)
 
-datafile_solvent = current_dir + '/mof_solubility/solvent/Acetone.csv'
+datafile_solvent = current_dir + '/solvents/Acetone.csv'
 atoms_solvent_list, atoms_solvent_pos_list = extract_elements_and_positions(datafile_solvent)
 
 graph_anions_data = get_graph(atoms_anions_list, atoms_anions_pos_list)   # torch_geometric.data.Data

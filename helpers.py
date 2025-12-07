@@ -25,17 +25,17 @@ def get_graph(atoms, pos, target=None):
     atom_to_num = {
         'C': 6, 'O': 8, 'Zn': 30, 'Pt': 78,
         'H': 1, 'Br': 35, 'I': 53,
-        'F': 9, 'Cl': 17, 'S': 16, 'N': 7, 'B': 5, 'Ag': 47, 'Bf': 5
+        'F': 9, 'Cl': 17, 'S': 16, 'N': 7, 'B': 5, 'Ag': 47, 'Bf': 5, 'P': 15, 'Au': 79
     }  # atom to atomic number
     atom_to_en = {
         'C': 2.55, 'O': 3.44, 'Zn': 1.65, 'Pt': 2.28,
         'H': 2.20, 'Br': 2.96, 'I': 2.66,
-        'F': 3.98, 'Cl': 3.16, 'S': 2.58, 'N': 3.04, 'B': 2.04, 'Ag': 1.93
+        'F': 3.98, 'Cl': 3.16, 'S': 2.58, 'N': 3.04, 'B': 2.04, 'Ag': 1.93, 'P': 2.19, 'Au': 2.54
     }  # atom to electronegativity (Pauling)
     atom_to_r = {
         'C': 70, 'O': 60, 'Zn': 135, 'Pt': 135,
         'H': 25, 'Br': 114, 'I': 133,
-        'F': 50, 'Cl': 99, 'S': 105, 'N': 65, 'B': 85, 'Ag': 165
+        'F': 50, 'Cl': 99, 'S': 105, 'N': 65, 'B': 85, 'Ag': 165, 'P': 107, 'Au': 144
     }  # atom to (approx.) covalent radius in pm
 
     atomic_nums = np.asarray([atom_to_num[atom] for atom in atoms])[:, np.newaxis] # keep as numpy for later use
@@ -325,5 +325,215 @@ def create_dataset_from_solubility(
         triplet = (anion_cache[anion_key], ligand_cache[pillarplex_id], solvent_cache[solvent_key])
         triplets_data.append(triplet)
         labels.append(label)
+    
+    return triplets_data, labels
+
+
+def load_anion_mapping(mapping_excel_path, current_dir=None):
+    """
+    Load anion ID to anion name mapping from Excel file.
+    
+    Args:
+        mapping_excel_path (str): Path to anion_mapping.xlsx
+        current_dir (str): Current directory (default os.getcwd())
+        
+    Returns:
+        dict: Mapping of anion_id (int) -> anion_name (str)
+              e.g., {1: 'F', 2: 'Cl', ..., 14: 'OAc', 15: 'OTf', 16: 'PF6', 17: 'BF4'}
+    """
+    if current_dir is None:
+        current_dir = os.getcwd()
+    
+    import pandas as pd
+    
+    full_path = os.path.join(current_dir, mapping_excel_path)
+    df = pd.read_excel(full_path, sheet_name='Sheet1')
+    
+    # The structure is: first column has 'id', second column has 'Anions:'
+    # We need to extract the mapping
+    mapping = {}
+    for idx, row in df.iterrows():
+        if idx == 0:  # Skip header row
+            continue
+        try:
+            anion_id = int(row.iloc[0])
+            anion_name = str(row.iloc[1]).strip()
+            if anion_name and anion_name.lower() != 'nan':
+                mapping[anion_id] = anion_name
+        except (ValueError, TypeError):
+            continue
+    
+    return mapping
+
+
+def load_solubility_excel(
+    excel_path,
+    anions_dir,
+    ligands_dict,
+    solvents_dir,
+    pillarplex_id,
+    current_dir=None
+):
+    """
+    Load solubility data from Excel file and create dataset.
+    
+    Excel format:
+    - Row 0: Headers (first column is anion ID, rest are solvent names)
+    - Row 1: "Solvent:" label
+    - Rows 2-13: Empty or data rows
+    - Rows 14+: Anion data with solubility labels (yes/slightly/no/-)
+    
+    Args:
+        excel_path (str): Path to Excel file (e.g., 'solubility/Ag_Pillarplex.xlsx')
+        anions_dir (str): Directory containing anion CSV files
+        ligands_dict (dict or str): Mapping of pillarplex_id -> ligand_file_path
+        solvents_dir (str): Directory containing solvent CSV files
+        pillarplex_id (str): ID of the Pillarplex (e.g., '2.1' for Ag, '3.1' for Au)
+        current_dir (str): Current directory (default os.getcwd())
+        
+    Returns:
+        tuple: (triplets_data, labels) where:
+            - triplets_data: list of (anion_graph, ligand_graph, solvent_graph) tuples
+            - labels: list of labels (0='no', 1='slightly', 2='yes')
+    """
+    if current_dir is None:
+        current_dir = os.getcwd()
+    
+    import pandas as pd
+    
+    # Load anion mapping (ID -> name)
+    anion_mapping = load_anion_mapping('anion_mapping.xlsx', current_dir)
+    print(f"Loaded anion mapping: {len(anion_mapping)} anions")
+    
+    # Read Excel file
+    df = pd.read_excel(excel_path, sheet_name=0)
+    
+    # Label mapping
+    label_map = {'no': 0, 'slightly': 1, 'yes': 2}
+    
+    # Extract solvent names from first row (skip first column which is "Anion:")
+    solvents = []
+    for col_idx in range(1, df.shape[1]):
+        col_name = df.columns[col_idx]
+        # Get the first row value to get actual solvent names
+        solvent_name = str(df.iloc[0, col_idx]).strip()
+        if solvent_name and solvent_name != 'nan':
+            solvents.append((col_idx, solvent_name))
+    
+    print(f"Found solvents: {[s[1] for s in solvents]}")
+    
+    # Extract anion data (starting from row 14 based on inspection)
+    data_start_row = 14
+    
+    triplets_data = []
+    labels = []
+    
+    # Cache for ligands, anions, solvents
+    ligand_cache = {}
+    anion_cache = {}
+    solvent_cache = {}
+    
+    # Load ligand once
+    if pillarplex_id not in ligand_cache:
+        if isinstance(ligands_dict, str):
+            ligand_file = ligands_dict
+        elif isinstance(ligands_dict, dict) and pillarplex_id in ligands_dict:
+            ligand_file = ligands_dict[pillarplex_id]
+        else:
+            raise ValueError(f"No ligand file specified for Pillarplex {pillarplex_id}")
+        
+        ligand_path = os.path.join(current_dir, ligand_file)
+        if os.path.exists(ligand_path):
+            atoms_ligand, pos_ligand = extract_last_snapshot(ligand_path)
+            ligand_cache[pillarplex_id] = get_graph(atoms_ligand, pos_ligand)
+        else:
+            raise FileNotFoundError(f"Ligand file not found: {ligand_path}")
+    
+    # Process each row (anion)
+    for row_idx in range(data_start_row, df.shape[0]):
+        anion_id_cell = str(df.iloc[row_idx, 0]).strip()
+        
+        # Parse anion ID
+        try:
+            anion_id = int(anion_id_cell)
+        except (ValueError, TypeError):
+            continue
+        
+        # Get anion name from mapping
+        if anion_id not in anion_mapping:
+            print(f"Warning: Anion ID {anion_id} not in mapping, skipping.")
+            continue
+        
+        anion_name = anion_mapping[anion_id]
+        
+        # Load anion (with cache)
+        anion_key = f"anion_{anion_name}"
+        if anion_key not in anion_cache:
+            # Try to find anion file
+            anion_path = None
+            anions_path = os.path.join(current_dir, anions_dir)
+            
+            # Look for {anion_name}.csv
+            test_path = os.path.join(anions_path, f"{anion_name}.csv")
+            if os.path.exists(test_path):
+                anion_path = test_path
+            else:
+                # Case-insensitive search
+                for fname in os.listdir(anions_path):
+                    if fname.lower() == f"{anion_name.lower()}.csv":
+                        anion_path = os.path.join(anions_path, fname)
+                        break
+            
+            if anion_path and os.path.exists(anion_path):
+                atoms_anion, pos_anion = extract_elements_and_positions(anion_path)
+                anion_cache[anion_key] = get_graph(atoms_anion, pos_anion)
+            else:
+                print(f"Warning: Anion file for {anion_name} (ID {anion_id}) not found, skipping.")
+                continue
+        
+        # Process each solvent
+        for col_idx, solvent_name in solvents:
+            cell_value = str(df.iloc[row_idx, col_idx]).strip().lower()
+            
+            # Skip missing data ('-' or 'nan' or empty)
+            if cell_value == '-' or cell_value == 'nan' or cell_value == '':
+                continue
+            
+            # Map label
+            if cell_value not in label_map:
+                print(f"Warning: Unknown label '{cell_value}' for anion {anion_name} (ID {anion_id}), solvent {solvent_name}")
+                continue
+            
+            label = label_map[cell_value]
+            
+            # Load solvent (with cache)
+            solvent_key = f"solvent_{solvent_name}"
+            if solvent_key not in solvent_cache:
+                # Try different solvent file names
+                solvent_path = None
+                solvents_path = os.path.join(current_dir, solvents_dir)
+                
+                # Try exact match first
+                test_path = os.path.join(solvents_path, f"{solvent_name}.csv")
+                if os.path.exists(test_path):
+                    solvent_path = test_path
+                else:
+                    # Try case-insensitive search
+                    for fname in os.listdir(solvents_path):
+                        if fname.lower() == f"{solvent_name.lower()}.csv":
+                            solvent_path = os.path.join(solvents_path, fname)
+                            break
+                
+                if solvent_path and os.path.exists(solvent_path):
+                    atoms_solvent, pos_solvent = extract_elements_and_positions(solvent_path)
+                    solvent_cache[solvent_key] = get_graph(atoms_solvent, pos_solvent)
+                else:
+                    print(f"Warning: Solvent {solvent_name} not found, skipping.")
+                    continue
+            
+            # Add triplet and label
+            triplet = (anion_cache[anion_key], ligand_cache[pillarplex_id], solvent_cache[solvent_key])
+            triplets_data.append(triplet)
+            labels.append(label)
     
     return triplets_data, labels
