@@ -1,31 +1,29 @@
 from ase.io import read
+import re
 
-
-def extract_last_snapshot(file_path):
-    # Read all snapshots from the .xyz file
+def extract_last_snapshot(file_path, return_energy=False):
+    """
+    Read the last snapshot from an XYZ file.
+    By default returns (atoms_list, positions_array).
+    If return_energy=True returns (atoms_list, positions_array, energy_or_None).
+    """
     snapshots = read(file_path, index=':')
-
-    # Get the last snapshot
     last_snapshot = snapshots[-1]
-
-    # Extract atoms and coordinates
     atoms = last_snapshot.get_chemical_symbols()
     coordinates = last_snapshot.get_positions()
 
-    # Initialize energy variable
-    energy = None
+    if return_energy:
+        energy = None
+        try:
+            with open(file_path, 'r') as file:
+                for line in reversed(file.readlines()):
+                    match = re.search(r'E\s*(-?\d+\.\d+)', line)
+                    if match:
+                        energy = float(match.group(1))
+                        break
+        except Exception:
+            energy = None
+        return atoms, coordinates, energy
 
-    # Extract energy from the last snapshot
-    with open(file_path, 'r') as file:
-        lines = file.readlines()
-        for line in reversed(lines):
-            match = re.search(r'E\s*(-?\d+\.\d+)', line)
-            if match:
-                energy = float(match.group(1))
-                break
-
-    # Check if energy was found
-    if energy is None:
-        raise ValueError(f"Energy not found in file: {file_path}")
-
-    return atoms, coordinates, energy
+    return atoms, coordinates
+# ...existing code...
