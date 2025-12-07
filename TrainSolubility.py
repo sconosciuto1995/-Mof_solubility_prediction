@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch_geometric.data import Batch
 import numpy as np
+from sklearn.metrics import confusion_matrix, classification_report
 
 from GnnClass2 import CombinedModel
 from helpers import load_solubility_excel
@@ -293,6 +294,8 @@ correct_per_class = [0, 0, 0]
 total_per_class = [0, 0, 0]
 overall_correct = 0
 overall_total = 0
+val_preds = []
+val_labels = []
 
 with torch.no_grad():
     for anions_b, ligands_b, solvents_b, labels_b in val_loader:
@@ -304,6 +307,10 @@ with torch.no_grad():
         logits = model(anions_b, ligands_b, solvents_b)
         preds = logits.argmax(dim=1)
         
+        # Store for confusion matrix
+        val_preds.extend(preds.cpu().numpy())
+        val_labels.extend(labels_b.cpu().numpy())
+        
         # Overall accuracy
         overall_correct += (preds == labels_b).sum().item()
         overall_total += labels_b.size(0)
@@ -325,6 +332,16 @@ for class_idx in range(3):
     else:
         print(f"  {label_names[class_idx]:10s}: No samples")
 
+# Confusion Matrix (Validation)
+print("\nConfusion Matrix (Validation Set):")
+val_cm = confusion_matrix(val_labels, val_preds, labels=[0, 1, 2])
+print(f"{'':15} Pred_no  Pred_slightly  Pred_yes")
+for i, class_name in enumerate(['no', 'slightly', 'yes']):
+    print(f"True_{class_name:8s}:  {val_cm[i, 0]:5d}    {val_cm[i, 1]:5d}        {val_cm[i, 2]:5d}")
+
+print("\nClassification Report (Validation Set):")
+print(classification_report(val_labels, val_preds, target_names=['no', 'slightly', 'yes'], digits=3))
+
 # Also evaluate on training set for comparison
 print("\n" + "="*80)
 print("TRAINING SET RESULTS (for reference)")
@@ -334,6 +351,8 @@ correct_per_class = [0, 0, 0]
 total_per_class = [0, 0, 0]
 overall_correct = 0
 overall_total = 0
+train_preds = []
+train_labels = []
 
 with torch.no_grad():
     for anions_b, ligands_b, solvents_b, labels_b in train_loader:
@@ -345,6 +364,10 @@ with torch.no_grad():
         logits = model(anions_b, ligands_b, solvents_b)
         preds = logits.argmax(dim=1)
         
+        # Store for confusion matrix
+        train_preds.extend(preds.cpu().numpy())
+        train_labels.extend(labels_b.cpu().numpy())
+        
         # Overall accuracy
         overall_correct += (preds == labels_b).sum().item()
         overall_total += labels_b.size(0)
@@ -365,5 +388,15 @@ for class_idx in range(3):
         print(f"  {label_names[class_idx]:10s}: {class_acc:.3f} ({correct_per_class[class_idx]}/{total_per_class[class_idx]})")
     else:
         print(f"  {label_names[class_idx]:10s}: No samples")
+
+# Confusion Matrix (Training)
+print("\nConfusion Matrix (Training Set):")
+train_cm = confusion_matrix(train_labels, train_preds, labels=[0, 1, 2])
+print(f"{'':15} Pred_no  Pred_slightly  Pred_yes")
+for i, class_name in enumerate(['no', 'slightly', 'yes']):
+    print(f"True_{class_name:8s}:  {train_cm[i, 0]:5d}    {train_cm[i, 1]:5d}        {train_cm[i, 2]:5d}")
+
+print("\nClassification Report (Training Set):")
+print(classification_report(train_labels, train_preds, target_names=['no', 'slightly', 'yes'], digits=3))
 
 print("\n" + "="*80)
