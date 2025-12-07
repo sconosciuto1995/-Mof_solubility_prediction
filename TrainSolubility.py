@@ -8,7 +8,7 @@ and trains the CombinedModel with proper labels (yes/slightly/no).
 import os
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torch_geometric.data import Batch
 import numpy as np
 
@@ -138,11 +138,20 @@ if len(all_triplets) == 0:
 
 # Create dataset and dataloader
 dataset = TripletDataset(all_triplets, all_labels)
-batch_size = 4
-loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_triplets)
 
+# Train/Validation split (80/20)
+train_size = int(0.8 * len(dataset))
+val_size = len(dataset) - train_size
+train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
+
+batch_size = 4
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_triplets)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_triplets)
+
+print(f"Train set: {len(train_dataset)} samples")
+print(f"Validation set: {len(val_dataset)} samples")
 print(f"Batch size: {batch_size}")
-print(f"Number of batches per epoch: {len(loader)}\n")
+print(f"Number of batches per epoch: {len(train_loader)}\n")
 
 # ============================================================================
 # MODEL SETUP
@@ -188,13 +197,18 @@ print("="*80)
 # TRAINING LOOP
 # ============================================================================
 
+best_val_acc = 0
+patience = 15
+patience_counter = 0
+
 for epoch in range(epochs):
+    # ========== TRAINING ==========
     model.train()
-    epoch_loss = 0.0
-    correct = 0
-    total = 0
+    train_loss = 0.0
+    train_correct = 0
+    train_total = 0
     
-    for batch_idx, (anions_b, ligands_b, solvents_b, labels_b) in enumerate(loader):
+    for batch_idx, (anions_b, ligands_b, solvents_b, labels_b) in enumerate(train_loader):
         anions_b = anions_b.to(device)
         ligands_b = ligands_b.to(device)
         solvents_b = solvents_b.to(device)
@@ -206,36 +220,123 @@ for epoch in range(epochs):
         loss.backward()
         optimizer.step()
 
-        epoch_loss += loss.item() * labels_b.size(0)
+        train_loss += loss.item() * labels_b.size(0)
         preds = logits.argmax(dim=1)
-        correct += (preds == labels_b).sum().item()
-        total += labels_b.size(0)
+        train_correct += (preds == labels_b).sum().item()
+        train_total += labels_b.size(0)
 
-    avg_loss = epoch_loss / len(dataset)
-    acc = correct / total
+    avg_train_loss = train_loss / len(train_dataset)
+    train_acc = train_correct / train_total
+
+    # ========== VALIDATION ==========
+    model.eval()
+    val_loss = 0.0
+    val_correct = 0
+    val_total = 0
+    
+    with torch.no_grad():
+        for anions_b, ligands_b, solvents_b, labels_b in val_loader:
+            anions_b = anions_b.to(device)
+            ligands_b = ligands_b.to(device)
+            solvents_b = solvents_b.to(device)
+            labels_b = labels_b.to(device)
+            
+            logits = model(anions_b, ligands_b, solvents_b)
+            loss = criterion(logits, labels_b)
+            val_loss += loss.item() * labels_b.size(0)
+            
+            preds = logits.argmax(dim=1)
+            val_correct += (preds == labels_b).sum().item()
+            val_total += labels_b.size(0)
+    
+    avg_val_loss = val_loss / len(val_dataset)
+    val_acc = val_correct / val_total
+    
+    # Early stopping
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        patience_counter = 0
+        # Save best model
+        torch.save(model.state_dict(), 'best_model.pth')
+    else:
+        patience_counter += 1
     
     if epoch % 10 == 0 or epoch == epochs - 1:
-        print(f"Epoch {epoch:03d}  loss={avg_loss:.4f}  acc={acc:.3f}")
+        print(f"Epoch {epoch:03d}  train_loss={avg_train_loss:.4f}  train_acc={train_acc:.3f}  "
+              f"val_loss={avg_val_loss:.4f}  val_acc={val_acc:.3f}")
+    
+    if patience_counter >= patience:
+        print(f"\nEarly stopping at epoch {epoch} (validation accuracy not improving)")
+        break
 
 print("\n" + "="*80)
 print("Training completed!")
+print(f"Best validation accuracy: {best_val_acc:.3f}")
 print("="*80)
 
 # ============================================================================
-# EVALUATION
+# EVALUATION ON VALIDATION SET
 # ============================================================================
 
-print("\nRunning evaluation on training set...")
+print("\nLoading best model...")
+model.load_state_dict(torch.load('best_model.pth', map_location=device))
 model.eval()
 
 label_names = {0: 'no', 1: 'slightly', 2: 'yes'}
+
+# Evaluate on validation set
+print("\n" + "="*80)
+print("VALIDATION SET RESULTS")
+print("="*80)
+
 correct_per_class = [0, 0, 0]
 total_per_class = [0, 0, 0]
 overall_correct = 0
 overall_total = 0
 
 with torch.no_grad():
-    for anions_b, ligands_b, solvents_b, labels_b in loader:
+    for anions_b, ligands_b, solvents_b, labels_b in val_loader:
+        anions_b = anions_b.to(device)
+        ligands_b = ligands_b.to(device)
+        solvents_b = solvents_b.to(device)
+        labels_b = labels_b.to(device)
+        
+        logits = model(anions_b, ligands_b, solvents_b)
+        preds = logits.argmax(dim=1)
+        
+        # Overall accuracy
+        overall_correct += (preds == labels_b).sum().item()
+        overall_total += labels_b.size(0)
+        
+        # Per-class accuracy
+        for class_idx in range(3):
+            class_mask = labels_b == class_idx
+            if class_mask.sum() > 0:
+                class_correct = (preds[class_mask] == labels_b[class_mask]).sum().item()
+                correct_per_class[class_idx] += class_correct
+                total_per_class[class_idx] += class_mask.sum().item()
+
+print(f"\nOverall Accuracy: {overall_correct/overall_total:.3f}")
+print("\nPer-class Accuracy:")
+for class_idx in range(3):
+    if total_per_class[class_idx] > 0:
+        class_acc = correct_per_class[class_idx] / total_per_class[class_idx]
+        print(f"  {label_names[class_idx]:10s}: {class_acc:.3f} ({correct_per_class[class_idx]}/{total_per_class[class_idx]})")
+    else:
+        print(f"  {label_names[class_idx]:10s}: No samples")
+
+# Also evaluate on training set for comparison
+print("\n" + "="*80)
+print("TRAINING SET RESULTS (for reference)")
+print("="*80)
+
+correct_per_class = [0, 0, 0]
+total_per_class = [0, 0, 0]
+overall_correct = 0
+overall_total = 0
+
+with torch.no_grad():
+    for anions_b, ligands_b, solvents_b, labels_b in train_loader:
         anions_b = anions_b.to(device)
         ligands_b = ligands_b.to(device)
         solvents_b = solvents_b.to(device)
@@ -266,8 +367,3 @@ for class_idx in range(3):
         print(f"  {label_names[class_idx]:10s}: No samples")
 
 print("\n" + "="*80)
-
-# Save model
-model_path = os.path.join(current_dir, 'model_solubility.pt')
-torch.save(model.state_dict(), model_path)
-print(f"Model saved to {model_path}")
