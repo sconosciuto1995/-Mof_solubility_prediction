@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch_geometric.data import Batch
 from torch_geometric.nn import NNConv, global_mean_pool, global_max_pool
+import gpytorch
 
 def init_weights(m):
     if isinstance(m, nn.Linear):
@@ -105,3 +106,64 @@ class CombinedModel(nn.Module):
 
 # backward-compatible alias
 BaseGNN = CombinedModel
+
+class FeatureExtractor(nn.Module):
+    """
+    Extrait les représentations intermédiaires des trois GNNs sans passer par le NN final.
+    Utile pour l'analyse des features apprises.
+    """
+    def __init__(self, base_gnn: CombinedModel):
+        super().__init__()
+        self.anion_gnn = base_gnn.anion_gnn
+        self.ligand_gnn = base_gnn.ligand_gnn
+        self.solvent_gnn = base_gnn.solvent_gnn
+
+    def forward(self, anion_graph: Batch, ligand_graph: Batch, solvent_graph: Batch):
+        a_repr = self.anion_gnn(anion_graph)
+        l_repr = self.ligand_gnn(ligand_graph)
+        s_repr = self.solvent_gnn(solvent_graph)
+        combined = torch.cat([a_repr, l_repr, s_repr], dim=1)
+        return combined
+    
+class ExactGPLayer(gpytorch.models.ExactGP):
+    """
+    Modèle GP exact utilisant les features extraites par FeatureExtractor.
+    """
+    def __init__(self, train_x, train_y, likelihood):
+        super(ExactGPLayer, self).__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(gpytorch.kernels.RBFKernel())
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+    
+class ExactGNNGP(nn.Module):
+    """
+    Modèle combinant un extracteur de features GNN et une couche GP exacte.
+    """
+
+    def __init__(self, feature_extractor, train_x, train_y):
+        super().__init__()
+        self.feature_extractor = feature_extractor
+        self.likelihood = gpytorch.likelihoods.GaussianLikelihood()
+        self.gp_layer = ExactGPLayer(train_x, train_y, self.likelihood)
+    
+    def forward(self, anion_graph, ligand_graph, solvent_graph):
+        features = self.feature_extractor(anion_graph, ligand_graph, solvent_graph)
+        return self.gp_layer(features)
+    
+    def predict(self, anion_graph, ligand_graph, solvent_graph):
+        self.eval()
+        self.likelihood.eval()
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            gp_dist = self.forward(anion_graph, ligand_graph, solvent_graph)
+            pred_dist = self.likelihood(gp_dist)
+            
+            mean = pred_dist.mean
+            
+            lower, upper = pred_dist.confidence_region()
+
+            
+        return mean, lower, upper
