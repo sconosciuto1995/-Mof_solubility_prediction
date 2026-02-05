@@ -13,12 +13,20 @@ from torch_geometric.data import Batch
 import numpy as np
 from sklearn.metrics import confusion_matrix, classification_report
 
+# Ajout pour les plots seaborn
+import seaborn as sns
+import matplotlib.pyplot as plt
+
 from GnnClass2 import CombinedModel
 from helpers import load_solubility_excel
 from read_xyz import extract_last_snapshot
 
 # Device
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = (
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
 print(f"Using device: {device}\n")
 
 current_dir = os.getcwd()
@@ -199,7 +207,7 @@ print("="*80)
 # ============================================================================
 
 best_val_acc = 0
-patience = 15
+patience = 45
 patience_counter = 0
 
 for epoch in range(epochs):
@@ -339,6 +347,15 @@ print(f"{'':15} Pred_no  Pred_slightly  Pred_yes")
 for i, class_name in enumerate(['no', 'slightly', 'yes']):
     print(f"True_{class_name:8s}:  {val_cm[i, 0]:5d}    {val_cm[i, 1]:5d}        {val_cm[i, 2]:5d}")
 
+# Plot colored confusion matrix (validation)
+plt.figure(figsize=(4,3))
+sns.heatmap(val_cm, annot=True, fmt='d', cmap='Blues', xticklabels=['no', 'slightly', 'yes'], yticklabels=['no', 'slightly', 'yes'])
+plt.title('Confusion Matrix (Validation Set)')
+plt.xlabel('Predicted label')
+plt.ylabel('True label')
+plt.tight_layout()
+plt.show()
+
 print("\nClassification Report (Validation Set):")
 print(classification_report(val_labels, val_preds, target_names=['no', 'slightly', 'yes'], digits=3))
 
@@ -395,6 +412,15 @@ train_cm = confusion_matrix(train_labels, train_preds, labels=[0, 1, 2])
 print(f"{'':15} Pred_no  Pred_slightly  Pred_yes")
 for i, class_name in enumerate(['no', 'slightly', 'yes']):
     print(f"True_{class_name:8s}:  {train_cm[i, 0]:5d}    {train_cm[i, 1]:5d}        {train_cm[i, 2]:5d}")
+
+# Plot colored confusion matrix (training)
+plt.figure(figsize=(4,3))
+sns.heatmap(train_cm, annot=True, fmt='d', cmap='Greens', xticklabels=['no', 'slightly', 'yes'], yticklabels=['no', 'slightly', 'yes'])
+plt.title('Confusion Matrix (Training Set)')
+plt.xlabel('Predicted label')
+plt.ylabel('True label')
+plt.tight_layout()
+plt.show()
 
 print("\nClassification Report (Training Set):")
 print(classification_report(train_labels, train_preds, target_names=['no', 'slightly', 'yes'], digits=3))
