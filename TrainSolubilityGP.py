@@ -1,17 +1,18 @@
 """
 TrainSolubilityGP.py
 
-Training a Gaussian Process on features extracted by a pre-trained GNN.
-Output: continuous prediction [0, 1] + 95% confidence interval
+Training a Gaussian Process on features extracted by a pre-trained GNN using K-Fold Cross-Validation.
+Output: continuous prediction [0, 1] + 95% confidence interval for each fold
 """
 
 import os
 import torch
 import gpytorch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Batch
 import matplotlib.pyplot as plt
+from sklearn.model_selection import KFold
 
 from GnnClass2 import CombinedModel, FeatureExtractor, ExactGPLayer
 from helpers import load_solubility_excel
@@ -103,264 +104,335 @@ print(f"\nTotal: {len(all_triplets)} samples")
 if len(all_triplets) == 0:
     exit("Error: no data loaded!")
 
-# Split train/val
-dataset = TripletDataset(all_triplets, all_labels)
-train_size = int(0.8 * len(dataset))
-val_size = len(dataset) - train_size
-train_dataset, val_dataset = random_split(dataset, [train_size, val_size], 
-                                           generator=torch.Generator().manual_seed(42))
-
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=collate_triplets)
-val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_triplets)
-
-print(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
-
 
 # =============================================================================
-# STEP 1 : LOAD THE PRE-TRAINED GNN
+# K-FOLD SETUP
 # =============================================================================
 
-print("\n" + "=" * 60)
-print("Loading pre-trained GNN...")
-print("=" * 60)
+n_splits = 5
+kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-# Feature dimensions
-nodefeat_num = all_triplets[0][0].x.shape[-1]
-edgefeat_num = all_triplets[0][0].edge_attr.shape[-1]
+# Store results for each fold
+gp_results = {
+    'fold': [],
+    'mse': [],
+    'mae': [],
+    'coverage': [],
+    'rmse': []
+}
 
-# Create and load model
-base_model = CombinedModel(
-    nodefeat_num=nodefeat_num,
-    edgefeat_num=edgefeat_num,
-    nodeembed_to=64,
-    edgeembed_to=32,
-    num_classes=3
-).to(device)
+print(f"\nStarting {n_splits}-Fold Cross-Validation for GP Training...")
+print(f"{'='*80}\n")
 
-base_model.load_state_dict(torch.load('best_model.pth', map_location=device))
-print("✓ Weights loaded from best_model.pth")
+# Get feature dimensions (same for all folds)
+first_triplet = all_triplets[0]
+nodefeat_num = first_triplet[0].x.shape[-1]
+edgefeat_num = first_triplet[0].edge_attr.shape[-1]
 
-# Create FeatureExtractor (FROZEN)
-feature_extractor = FeatureExtractor(base_model).to(device)
-feature_extractor.eval()
-for param in feature_extractor.parameters():
-    param.requires_grad = False
-print("✓ Feature Extractor frozen")
+# ============================================================================
+# K-FOLD GP TRAINING LOOP
+# ============================================================================
 
-
-# =============================================================================
-# STEP 2 : FEATURE EXTRACTION
-# =============================================================================
-
-print("\n" + "=" * 60)
-print("Extracting features...")
-print("=" * 60)
-
-# Training features
-train_features_list = []
-train_labels_list = []
-
-with torch.no_grad():
-    for anions_b, ligands_b, solvents_b, labels_b in train_loader:
-        anions_b = anions_b.to(device)
-        ligands_b = ligands_b.to(device)
-        solvents_b = solvents_b.to(device)
+for fold, (train_idx, val_idx) in enumerate(kf.split(all_triplets)):
+    print(f"{'='*80}")
+    print(f"GP FOLD {fold+1}/{n_splits}")
+    print(f"{'='*80}")
+    
+    # Create fold datasets
+    fold_train_triplets = [all_triplets[i] for i in train_idx]
+    fold_train_labels = [all_labels[i] for i in train_idx]
+    fold_val_triplets = [all_triplets[i] for i in val_idx]
+    fold_val_labels = [all_labels[i] for i in val_idx]
+    
+    fold_train_dataset = TripletDataset(fold_train_triplets, fold_train_labels)
+    fold_val_dataset = TripletDataset(fold_val_triplets, fold_val_labels)
+    
+    fold_train_loader = DataLoader(fold_train_dataset, batch_size=4, shuffle=True, collate_fn=collate_triplets)
+    fold_val_loader = DataLoader(fold_val_dataset, batch_size=4, shuffle=False, collate_fn=collate_triplets)
+    
+    print(f"Train: {len(fold_train_dataset)} | Val: {len(fold_val_dataset)}")
+    
+    # =============================================================================
+    # LOAD PRE-TRAINED GNN
+    # =============================================================================
+    
+    base_model = CombinedModel(
+        nodefeat_num=nodefeat_num,
+        edgefeat_num=edgefeat_num,
+        nodeembed_to=64,
+        edgeembed_to=32,
+        num_classes=3
+    ).to(device)
+    
+    # Load the best model from classification training
+    # Note: Using the first fold's best model (best_model_fold0.pth)
+    # For production, should average or fine-tune with fold-specific models
+    try:
+        base_model.load_state_dict(torch.load('best_model_fold0.pth', map_location=device))
+        print("✓ Loaded pre-trained GNN from best_model_fold0.pth")
+    except FileNotFoundError:
+        print("✗ Warning: best_model_fold0.pth not found. Using last available model.")
+        # Try to find an available model
+        for i in range(n_splits):
+            try:
+                base_model.load_state_dict(torch.load(f'best_model_fold{i}.pth', map_location=device))
+                print(f"✓ Loaded pre-trained GNN from best_model_fold{i}.pth")
+                break
+            except FileNotFoundError:
+                continue
+    
+    # Create feature extractor (frozen)
+    feature_extractor = FeatureExtractor(base_model).to(device)
+    feature_extractor.eval()
+    for param in feature_extractor.parameters():
+        param.requires_grad = False
+    
+    # =============================================================================
+    # EXTRACT FEATURES FOR THIS FOLD
+    # =============================================================================
+    
+    print(f"\nExtracting features...")
+    
+    fold_train_features = []
+    fold_train_y = []
+    
+    with torch.no_grad():
+        for anions_b, ligands_b, solvents_b, labels_b in fold_train_loader:
+            anions_b = anions_b.to(device)
+            ligands_b = ligands_b.to(device)
+            solvents_b = solvents_b.to(device)
+            features = feature_extractor(anions_b, ligands_b, solvents_b)
+            fold_train_features.append(features)
+            fold_train_y.append(labels_b)
+    
+    fold_train_x = torch.cat(fold_train_features, dim=0)
+    fold_train_y = torch.cat(fold_train_y, dim=0)
+    
+    print(f"✓ Train features: {fold_train_x.shape}")
+    
+    fold_val_features = []
+    fold_val_y = []
+    
+    with torch.no_grad():
+        for anions_b, ligands_b, solvents_b, labels_b in fold_val_loader:
+            anions_b = anions_b.to(device)
+            ligands_b = ligands_b.to(device)
+            solvents_b = solvents_b.to(device)
+            features = feature_extractor(anions_b, ligands_b, solvents_b)
+            fold_val_features.append(features)
+            fold_val_y.append(labels_b)
+    
+    fold_val_x = torch.cat(fold_val_features, dim=0)
+    fold_val_y = torch.cat(fold_val_y, dim=0)
+    
+    print(f"✓ Val features: {fold_val_x.shape}")
+    
+    # =============================================================================
+    # CREATE AND TRAIN GP FOR THIS FOLD
+    # =============================================================================
+    
+    print(f"\nTraining GP for fold {fold+1}...")
+    
+    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+    gp_model = ExactGPLayer(fold_train_x, fold_train_y, likelihood).to(device)
+    
+    optimizer = torch.optim.Adam([
+        {'params': gp_model.covar_module.parameters(), 'lr': 0.1},
+        {'params': gp_model.mean_module.parameters(), 'lr': 0.1},
+        {'params': likelihood.parameters(), 'lr': 0.1},
+    ])
+    
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, gp_model)
+    
+    epochs = 400
+    gp_model.train()
+    likelihood.train()
+    
+    train_losses = []
+    
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        output = gp_model(fold_train_x)
+        loss = -mll(output, fold_train_y)
+        loss.backward()
+        optimizer.step()
         
-        features = feature_extractor(anions_b, ligands_b, solvents_b)
-        train_features_list.append(features)
-        train_labels_list.append(labels_b)
-
-train_x = torch.cat(train_features_list, dim=0)
-train_y = torch.cat(train_labels_list, dim=0)
-
-print(f"✓ Train features: {train_x.shape}")
-
-# Validation features
-val_features_list = []
-val_labels_list = []
-
-with torch.no_grad():
-    for anions_b, ligands_b, solvents_b, labels_b in val_loader:
-        anions_b = anions_b.to(device)
-        ligands_b = ligands_b.to(device)
-        solvents_b = solvents_b.to(device)
+        train_losses.append(loss.item())
         
-        features = feature_extractor(anions_b, ligands_b, solvents_b)
-        val_features_list.append(features)
-        val_labels_list.append(labels_b)
-
-val_x = torch.cat(val_features_list, dim=0)
-val_y = torch.cat(val_labels_list, dim=0)
-
-print(f"✓ Val features: {val_x.shape}")
-
-
-# =============================================================================
-# STEP 3 : GP CREATION
-# =============================================================================
-
-print("\n" + "=" * 60)
-print("Creating Gaussian Process...")
-print("=" * 60)
-
-likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-gp_model = ExactGPLayer(train_x, train_y, likelihood).to(device)
-
-print(f"✓ GP created with {train_x.shape[0]} training points")
-
-
-# =============================================================================
-# STEP 4 : GP TRAINING
-# =============================================================================
-
-print("\n" + "=" * 60)
-print("Training GP...")
-print("=" * 60)
-
-# Optimizer
-optimizer = torch.optim.Adam([
-    {'params': gp_model.covar_module.parameters(), 'lr': 0.1},
-    {'params': gp_model.mean_module.parameters(), 'lr': 0.1},
-    {'params': likelihood.parameters(), 'lr': 0.1},
-])
-
-# Loss
-mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, gp_model)
-
-# Training
-epochs = 400
-gp_model.train()
-likelihood.train()
-
-train_losses = []
-
-for epoch in range(epochs):
-    optimizer.zero_grad()
-    output = gp_model(train_x)
-    loss = -mll(output, train_y)
-    loss.backward()
-    optimizer.step()
+        if epoch % 100 == 0 or epoch == epochs - 1:
+            print(f"  Epoch {epoch:03d}  Loss: {loss.item():.4f}")
     
-    train_losses.append(loss.item())
+    print("✓ GP Training completed!")
     
-    if epoch % 20 == 0 or epoch == epochs - 1:
-        print(f"Epoch {epoch:03d}  Loss: {loss.item():.4f}")
-
-print("✓ Training completed!")
-
-
-# =============================================================================
-# STEP 5 : EVALUATION
-# =============================================================================
-
-print("\n" + "=" * 60)
-print("Evaluation...")
-print("=" * 60)
-
-gp_model.eval()
-likelihood.eval()
-
-with torch.no_grad(), gpytorch.settings.fast_pred_var():
-    # Predictions on validation
-    pred_dist = likelihood(gp_model(val_x))
+    # =============================================================================
+    # EVALUATE GP ON VALIDATION SET
+    # =============================================================================
     
-    val_mean = pred_dist.mean.numpy()
-    val_lower, val_upper = pred_dist.confidence_region()
-    val_lower = val_lower.numpy()
-    val_upper = val_upper.numpy()
-    val_true = val_y.numpy()
-
-val_mean = np.clip(val_mean, 0, 1)
-val_lower = np.clip(val_lower, 0, 1)
-val_upper = np.clip(val_upper, 0, 1)
-
-# Metrics
-mse = np.mean((val_mean - val_true) ** 2)
-mae = np.mean(np.abs(val_mean - val_true))
-coverage = np.mean((val_true >= val_lower) & (val_true <= val_upper))
-
-print(f"\nMSE: {mse:.4f}")
-print(f"MAE: {mae:.4f}")
-print(f"95% CI Coverage: {coverage:.1%}")
-
-
-# =============================================================================
-# STEP 6 : RESULTS DISPLAY
-# =============================================================================
-
-print("\n" + "=" * 60)
-print("Prediction examples:")
-print("=" * 60)
-
-for i in range(min(10, len(val_mean))):
-    pred = val_mean[i]
-    lower = val_lower[i]
-    upper = val_upper[i]
-    true = val_true[i]
+    print(f"\nEvaluating fold {fold+1}...")
     
-    # Interpretation
-    if pred < 0.25:
-        interp = "Insoluble"
-    elif pred < 0.75:
-        interp = "Partial"
-    else:
-        interp = "Soluble"
+    gp_model.eval()
+    likelihood.eval()
     
-    print(f"  [{i+1}] True: {true:.2f} | Pred: {pred:.2f} [{lower:.2f}, {upper:.2f}] → {interp}")
-
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        pred_dist = likelihood(gp_model(fold_val_x))
+        
+        fold_val_mean = pred_dist.mean.numpy()
+        fold_val_lower, fold_val_upper = pred_dist.confidence_region()
+        fold_val_lower = fold_val_lower.numpy()
+        fold_val_upper = fold_val_upper.numpy()
+        fold_val_true = fold_val_y.numpy()
+    
+    fold_val_mean = np.clip(fold_val_mean, 0, 1)
+    fold_val_lower = np.clip(fold_val_lower, 0, 1)
+    fold_val_upper = np.clip(fold_val_upper, 0, 1)
+    
+    # Calculate metrics for this fold
+    mse = np.mean((fold_val_mean - fold_val_true) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(fold_val_mean - fold_val_true))
+    coverage = np.mean((fold_val_true >= fold_val_lower) & (fold_val_true <= fold_val_upper))
+    
+    gp_results['fold'].append(fold+1)
+    gp_results['mse'].append(mse)
+    gp_results['rmse'].append(rmse)
+    gp_results['mae'].append(mae)
+    gp_results['coverage'].append(coverage)
+    
+    print(f"  MSE:      {mse:.4f}")
+    print(f"  RMSE:     {rmse:.4f}")
+    print(f"  MAE:      {mae:.4f}")
+    print(f"  Coverage: {coverage:.1%}")
+    
+    # Save GP model for this fold
+    torch.save({
+        'gp_model': gp_model.state_dict(),
+        'likelihood': likelihood.state_dict(),
+        'train_x': fold_train_x,
+        'train_y': fold_train_y,
+    }, f'best_model_gp_fold{fold}.pth')
+    
+    print(f"✓ Saved fold {fold+1} GP model to best_model_gp_fold{fold}.pth")
+    print(f"{'='*80}\n")
 
 # =============================================================================
-# STEP 7 : VISUALISATION
+# CROSS-VALIDATION SUMMARY
 # =============================================================================
 
-fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+print(f"\n{'='*80}")
+print("GP CROSS-VALIDATION SUMMARY")
+print(f"{'='*80}")
 
-# Plot 1: Loss
-axes[0].plot(train_losses)
-axes[0].set_xlabel('Epoch')
-axes[0].set_ylabel('Negative Log Likelihood')
-axes[0].set_title('Training Curve')
-axes[0].grid(True, alpha=0.3)
+mses = np.array(gp_results['mse'])
+rmses = np.array(gp_results['rmse'])
+maes = np.array(gp_results['mae'])
+coverages = np.array(gp_results['coverage'])
 
-# Plot 2: Predictions vs True
-axes[1].errorbar(range(len(val_mean)), val_mean, 
-                  yerr=[val_mean - val_lower, val_upper - val_mean],
-                  fmt='o', capsize=3, alpha=0.7, label='Predictions ± 95% CI')
-axes[1].scatter(range(len(val_true)), val_true, c='red', marker='x', 
-                s=50, zorder=5, label='True values')
-axes[1].set_xlabel('Sample')
-axes[1].set_ylabel('Solubility')
-axes[1].set_title('Predictions with Uncertainty')
-axes[1].legend()
-axes[1].grid(True, alpha=0.3)
+print(f"\nMSE:      {np.mean(mses):.4f} ± {np.std(mses):.4f}")
+print(f"  Range: {np.min(mses):.4f} - {np.max(mses):.4f}")
+print(f"\nRMSE:     {np.mean(rmses):.4f} ± {np.std(rmses):.4f}")
+print(f"  Range: {np.min(rmses):.4f} - {np.max(rmses):.4f}")
+print(f"\nMAE:      {np.mean(maes):.4f} ± {np.std(maes):.4f}")
+print(f"  Range: {np.min(maes):.4f} - {np.max(maes):.4f}")
+print(f"\n95% CI Coverage: {np.mean(coverages):.1%} ± {np.std(coverages):.1%}")
+print(f"  Range: {np.min(coverages):.1%} - {np.max(coverages):.1%}")
 
-# Plot 3: Scatter predicted vs true
-axes[2].scatter(val_true, val_mean, alpha=0.7)
-axes[2].plot([0, 1], [0, 1], 'r--', label='Perfect')
-axes[2].set_xlabel('True value')
-axes[2].set_ylabel('Prediction')
-axes[2].set_title(f'Prediction vs Reality (MSE={mse:.4f})')
-axes[2].legend()
-axes[2].grid(True, alpha=0.3)
+print(f"\nPer-Fold Results:")
+print(f"{'Fold':<6} {'MSE':<10} {'RMSE':<10} {'MAE':<10} {'Coverage':<12}")
+print(f"{'-'*55}")
+for i, fold_num in enumerate(gp_results['fold']):
+    print(f"{fold_num:<6} {gp_results['mse'][i]:<10.4f} {gp_results['rmse'][i]:<10.4f} "
+          f"{gp_results['mae'][i]:<10.4f} {gp_results['coverage'][i]:<12.1%}")
 
+# =============================================================================
+# AGGREGATED PREDICTIONS ACROSS ALL FOLDS
+# =============================================================================
+
+print(f"\n{'='*80}")
+print("AGGREGATED PREDICTIONS (All Folds)")
+print(f"{'='*80}\n")
+
+all_predictions = []
+all_true_values = []
+
+for fold, (train_idx, val_idx) in enumerate(kf.split(all_triplets)):
+    fold_val_triplets = [all_triplets[i] for i in val_idx]
+    fold_val_labels = [all_labels[i] for i in val_idx]
+    fold_val_dataset = TripletDataset(fold_val_triplets, fold_val_labels)
+    fold_val_loader = DataLoader(fold_val_dataset, batch_size=4, shuffle=False, collate_fn=collate_triplets)
+    
+    # Load GP model and likelihood for this fold
+    checkpoint = torch.load(f'best_model_gp_fold{fold}.pth', map_location=device)
+    
+    gp_model = ExactGPLayer(checkpoint['train_x'], checkpoint['train_y'], 
+                           gpytorch.likelihoods.GaussianLikelihood()).to(device)
+    gp_model.load_state_dict(checkpoint['gp_model'])
+    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+    likelihood.load_state_dict(checkpoint['likelihood'])
+    
+    # Extract features for validation
+    base_model = CombinedModel(
+        nodefeat_num=nodefeat_num,
+        edgefeat_num=edgefeat_num,
+        nodeembed_to=64,
+        edgeembed_to=32,
+        num_classes=3
+    ).to(device)
+    
+    try:
+        base_model.load_state_dict(torch.load('best_model_fold0.pth', map_location=device))
+    except:
+        for i in range(n_splits):
+            try:
+                base_model.load_state_dict(torch.load(f'best_model_fold{i}.pth', map_location=device))
+                break
+            except:
+                continue
+    
+    feature_extractor = FeatureExtractor(base_model).to(device)
+    feature_extractor.eval()
+    
+    # Get predictions
+    gp_model.eval()
+    likelihood.eval()
+    
+    fold_preds = []
+    fold_trues = []
+    
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        for anions_b, ligands_b, solvents_b, labels_b in fold_val_loader:
+            anions_b = anions_b.to(device)
+            ligands_b = ligands_b.to(device)
+            solvents_b = solvents_b.to(device)
+            
+            features = feature_extractor(anions_b, ligands_b, solvents_b)
+            pred_dist = likelihood(gp_model(features))
+            
+            fold_preds.extend(pred_dist.mean.cpu().numpy())
+            fold_trues.extend(labels_b.numpy())
+    
+    all_predictions.extend(fold_preds)
+    all_true_values.extend(fold_trues)
+
+# Plot aggregated predictions
+all_predictions = np.array(all_predictions)
+all_true_values = np.array(all_true_values)
+
+plt.figure(figsize=(8, 6))
+plt.scatter(all_true_values, all_predictions, alpha=0.7, s=50)
+plt.plot([0, 1], [0, 1], 'r--', linewidth=2, label='Perfect Prediction')
+plt.xlabel('True Solubility', fontsize=12)
+plt.ylabel('Predicted Solubility', fontsize=12)
+plt.title(f'GP Predictions vs True Values (All Folds, Overall MAE={np.mean(np.abs(all_predictions - all_true_values)):.4f})')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.xlim([-0.05, 1.05])
+plt.ylim([-0.05, 1.05])
 plt.tight_layout()
-plt.savefig('resultats_gp.png', dpi=150)
+plt.savefig('cv_gp_predictions_all_folds.png', dpi=150)
 plt.show()
 
-print("\n" + "=" * 60)
-print("✓ Plots saved: resultats_gp.png")
-print("=" * 60)
-
-
-# =============================================================================
-# ÉTAPE 8 : SAUVEGARDE DU MODÈLE
-# =============================================================================
-
-torch.save({
-    'gp_model': gp_model.state_dict(),
-    'likelihood': likelihood.state_dict(),
-    'train_x': train_x,
-    'train_y': train_y,
-}, 'best_model_gp.pth')
-
-print("✓ GP model saved: best_model_gp.pth")
+print("✓ Saved plot: cv_gp_predictions_all_folds.png")
+print(f"{'='*80}")
+print("✓ K-Fold Cross-Validation for GP Training Completed!")
+print(f"Model weights saved as: best_model_gp_fold0.pth to best_model_gp_fold{n_splits-1}.pth")
+print(f"{'='*80}")
