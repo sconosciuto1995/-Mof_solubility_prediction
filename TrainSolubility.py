@@ -1,24 +1,33 @@
 """
-Training script using real solubility data from Excel files.
+Training script using real solubility data from Excel files with K-Fold Cross-Validation.
 
 Loads data from solubility/Ag_Pillarplex.xlsx and solubility/Au_Pillarplex.xlsx
-and trains the CombinedModel with proper labels (yes/slightly/no).
+and trains the CombinedModel with proper labels (yes/slightly/no) using StratifiedKFold.
 """
 
 import os
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Batch
 import numpy as np
 from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.model_selection import StratifiedKFold
+
+# Ajout pour les plots seaborn
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 from GnnClass2 import CombinedModel
 from helpers import load_solubility_excel
 from read_xyz import extract_last_snapshot
 
 # Device
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = (
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
 print(f"Using device: {device}\n")
 
 current_dir = os.getcwd()
@@ -137,103 +146,180 @@ if len(all_triplets) == 0:
     print(f"  - Ligand files exist in {current_dir}/mof_solubility/ligand/xyz/")
     exit(1)
 
-# Create dataset and dataloader
+# Create dataset
 dataset = TripletDataset(all_triplets, all_labels)
 
-# Train/Validation split (80/20)
-train_size = int(0.8 * len(dataset))
-val_size = len(dataset) - train_size
-train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42))
+# Setup k-fold cross-validation
+n_splits = 5
+skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-batch_size = 4
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_triplets)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_triplets)
+# Store results for each fold
+fold_results = {
+    'fold': [],
+    'train_acc': [],
+    'val_acc': [],
+    'train_loss': [],
+    'val_loss': [],
+    'val_confusion_matrices': [],
+    'train_confusion_matrices': []
+}
 
-print(f"Train set: {len(train_dataset)} samples")
-print(f"Validation set: {len(val_dataset)} samples")
-print(f"Batch size: {batch_size}")
-print(f"Number of batches per epoch: {len(train_loader)}\n")
+print(f"Starting {n_splits}-Fold Stratified Cross-Validation...")
+print(f"{'='*80}\n")
 
-# ============================================================================
-# MODEL SETUP
-# ============================================================================
-
-print("="*80)
-print("Creating model...")
-print("="*80)
-
-# Get feature dimensions from first sample
+# Get feature dimensions from first sample (same for all folds)
 first_triplet = all_triplets[0]
 nodefeat_num = first_triplet[0].x.shape[-1]
 edgefeat_num = first_triplet[0].edge_attr.shape[-1]
 
 print(f"Node features: {nodefeat_num}")
-print(f"Edge features: {edgefeat_num}")
-
-model = CombinedModel(
-    nodefeat_num=nodefeat_num,
-    edgefeat_num=edgefeat_num,
-    nodeembed_to=64,
-    edgeembed_to=32,
-    num_classes=3  # 0='no', 1='slightly', 2='yes'
-)
-model.to(device)
-
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Total model parameters: {total_params}\n")
+print(f"Edge features: {edgefeat_num}\n")
 
 # ============================================================================
-# TRAINING SETUP
+# K-FOLD TRAINING LOOP
 # ============================================================================
 
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-criterion = torch.nn.CrossEntropyLoss()
-epochs = 100
-
-print("="*80)
-print("Starting training...")
-print("="*80)
-
-# ============================================================================
-# TRAINING LOOP
-# ============================================================================
-
-best_val_acc = 0
-patience = 15
-patience_counter = 0
-
-for epoch in range(epochs):
-    # ========== TRAINING ==========
-    model.train()
-    train_loss = 0.0
-    train_correct = 0
-    train_total = 0
+for fold, (train_idx, val_idx) in enumerate(skf.split(all_triplets, all_labels)):
+    print(f"{'='*80}")
+    print(f"FOLD {fold+1}/{n_splits}")
+    print(f"{'='*80}")
     
-    for batch_idx, (anions_b, ligands_b, solvents_b, labels_b) in enumerate(train_loader):
-        anions_b = anions_b.to(device)
-        ligands_b = ligands_b.to(device)
-        solvents_b = solvents_b.to(device)
-        labels_b = labels_b.to(device)
+    # Create fold datasets
+    fold_train_triplets = [all_triplets[i] for i in train_idx]
+    fold_train_labels = [all_labels[i] for i in train_idx]
+    fold_val_triplets = [all_triplets[i] for i in val_idx]
+    fold_val_labels = [all_labels[i] for i in val_idx]
+    
+    # Create TripletDataset for this fold
+    train_dataset = TripletDataset(fold_train_triplets, fold_train_labels)
+    val_dataset = TripletDataset(fold_val_triplets, fold_val_labels)
+    
+    # Create DataLoaders
+    batch_size = 4
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_triplets)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_triplets)
+    
+    print(f"Train set: {len(train_dataset)} samples")
+    print(f"Validation set: {len(val_dataset)} samples")
+    print(f"Batch size: {batch_size}\n")
+    
+    # ============================================================================
+    # MODEL SETUP FOR THIS FOLD
+    # ============================================================================
+    
+    model = CombinedModel(
+        nodefeat_num=nodefeat_num,
+        edgefeat_num=edgefeat_num,
+        nodeembed_to=64,
+        edgeembed_to=32,
+        num_classes=3
+    )
+    model.to(device)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params}")
+    
+    # ============================================================================
+    # TRAINING SETUP FOR THIS FOLD
+    # ============================================================================
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = torch.nn.CrossEntropyLoss()
+    epochs = 100
+    
+    # ============================================================================
+    # TRAINING LOOP FOR THIS FOLD
+    # ============================================================================
+    
+    best_val_acc = 0
+    patience = 45
+    patience_counter = 0
+    
+    print(f"\nTraining fold {fold+1}...")
+    
+    for epoch in range(epochs):
+        # ========== TRAINING ==========
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        for batch_idx, (anions_b, ligands_b, solvents_b, labels_b) in enumerate(train_loader):
+            anions_b = anions_b.to(device)
+            ligands_b = ligands_b.to(device)
+            solvents_b = solvents_b.to(device)
+            labels_b = labels_b.to(device)
 
-        optimizer.zero_grad()
-        logits = model(anions_b, ligands_b, solvents_b)  # shape [batch_size, 3]
-        loss = criterion(logits, labels_b)
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad()
+            logits = model(anions_b, ligands_b, solvents_b)
+            loss = criterion(logits, labels_b)
+            loss.backward()
+            optimizer.step()
 
-        train_loss += loss.item() * labels_b.size(0)
-        preds = logits.argmax(dim=1)
-        train_correct += (preds == labels_b).sum().item()
-        train_total += labels_b.size(0)
+            train_loss += loss.item() * labels_b.size(0)
+            preds = logits.argmax(dim=1)
+            train_correct += (preds == labels_b).sum().item()
+            train_total += labels_b.size(0)
 
-    avg_train_loss = train_loss / len(train_dataset)
-    train_acc = train_correct / train_total
+        avg_train_loss = train_loss / len(train_dataset)
+        train_acc = train_correct / train_total
 
-    # ========== VALIDATION ==========
+        # ========== VALIDATION ==========
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for anions_b, ligands_b, solvents_b, labels_b in val_loader:
+                anions_b = anions_b.to(device)
+                ligands_b = ligands_b.to(device)
+                solvents_b = solvents_b.to(device)
+                labels_b = labels_b.to(device)
+                
+                logits = model(anions_b, ligands_b, solvents_b)
+                loss = criterion(logits, labels_b)
+                val_loss += loss.item() * labels_b.size(0)
+                
+                preds = logits.argmax(dim=1)
+                val_correct += (preds == labels_b).sum().item()
+                val_total += labels_b.size(0)
+        
+        avg_val_loss = val_loss / len(val_dataset)
+        val_acc = val_correct / val_total
+        
+        # Early stopping
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
+            # Save best model for this fold
+            torch.save(model.state_dict(), f'best_model_fold{fold}.pth')
+        else:
+            patience_counter += 1
+        
+        if epoch % 20 == 0 or epoch == epochs - 1:
+            print(f"  Epoch {epoch:03d}  train_loss={avg_train_loss:.4f}  train_acc={train_acc:.3f}  "
+                  f"val_loss={avg_val_loss:.4f}  val_acc={val_acc:.3f}")
+        
+        if patience_counter >= patience:
+            print(f"  Early stopping at epoch {epoch} (patience={patience})")
+            break
+    
+    # ============================================================================
+    # FOLD EVALUATION
+    # ============================================================================
+    
+    print(f"\nEvaluating fold {fold+1}...")
+    
+    # Load best model for this fold
+    model.load_state_dict(torch.load(f'best_model_fold{fold}.pth', map_location=device))
     model.eval()
-    val_loss = 0.0
-    val_correct = 0
-    val_total = 0
+    
+    label_names = {0: 'no', 1: 'slightly', 2: 'yes'}
+    
+    # Validation evaluation
+    val_preds = []
+    val_labels_list = []
     
     with torch.no_grad():
         for anions_b, ligands_b, solvents_b, labels_b in val_loader:
@@ -243,160 +329,172 @@ for epoch in range(epochs):
             labels_b = labels_b.to(device)
             
             logits = model(anions_b, ligands_b, solvents_b)
-            loss = criterion(logits, labels_b)
-            val_loss += loss.item() * labels_b.size(0)
-            
             preds = logits.argmax(dim=1)
-            val_correct += (preds == labels_b).sum().item()
-            val_total += labels_b.size(0)
+            
+            val_preds.extend(preds.cpu().numpy())
+            val_labels_list.extend(labels_b.cpu().numpy())
     
-    avg_val_loss = val_loss / len(val_dataset)
-    val_acc = val_correct / val_total
+    val_acc_final = np.mean(np.array(val_preds) == np.array(val_labels_list))
+    val_cm = confusion_matrix(val_labels_list, val_preds, labels=[0, 1, 2])
     
-    # Early stopping
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        patience_counter = 0
-        # Save best model
-        torch.save(model.state_dict(), 'best_model.pth')
-    else:
-        patience_counter += 1
+    # Training evaluation
+    train_preds = []
+    train_labels_list = []
     
-    if epoch % 10 == 0 or epoch == epochs - 1:
-        print(f"Epoch {epoch:03d}  train_loss={avg_train_loss:.4f}  train_acc={train_acc:.3f}  "
-              f"val_loss={avg_val_loss:.4f}  val_acc={val_acc:.3f}")
+    with torch.no_grad():
+        for anions_b, ligands_b, solvents_b, labels_b in train_loader:
+            anions_b = anions_b.to(device)
+            ligands_b = ligands_b.to(device)
+            solvents_b = solvents_b.to(device)
+            labels_b = labels_b.to(device)
+            
+            logits = model(anions_b, ligands_b, solvents_b)
+            preds = logits.argmax(dim=1)
+            
+            train_preds.extend(preds.cpu().numpy())
+            train_labels_list.extend(labels_b.cpu().numpy())
     
-    if patience_counter >= patience:
-        print(f"\nEarly stopping at epoch {epoch} (validation accuracy not improving)")
-        break
-
-print("\n" + "="*80)
-print("Training completed!")
-print(f"Best validation accuracy: {best_val_acc:.3f}")
-print("="*80)
+    train_acc_final = np.mean(np.array(train_preds) == np.array(train_labels_list))
+    train_cm = confusion_matrix(train_labels_list, train_preds, labels=[0, 1, 2])
+    
+    # Store fold results
+    fold_results['fold'].append(fold+1)
+    fold_results['train_acc'].append(train_acc_final)
+    fold_results['val_acc'].append(val_acc_final)
+    fold_results['train_loss'].append(avg_train_loss)
+    fold_results['val_loss'].append(avg_val_loss)
+    fold_results['val_confusion_matrices'].append(val_cm)
+    fold_results['train_confusion_matrices'].append(train_cm)
+    
+    print(f"  Train Accuracy: {train_acc_final:.3f}")
+    print(f"  Val Accuracy:   {val_acc_final:.3f}")
+    print(f"{'='*80}\n")
 
 # ============================================================================
-# EVALUATION ON VALIDATION SET
+# CROSS-VALIDATION SUMMARY
 # ============================================================================
 
-print("\nLoading best model...")
-model.load_state_dict(torch.load('best_model.pth', map_location=device))
-model.eval()
+print(f"\n{'='*80}")
+print("CROSS-VALIDATION SUMMARY")
+print(f"{'='*80}")
 
-label_names = {0: 'no', 1: 'slightly', 2: 'yes'}
+train_accs = np.array(fold_results['train_acc'])
+val_accs = np.array(fold_results['val_acc'])
+train_losses = np.array(fold_results['train_loss'])
+val_losses = np.array(fold_results['val_loss'])
 
-# Evaluate on validation set
-print("\n" + "="*80)
-print("VALIDATION SET RESULTS")
-print("="*80)
+print(f"\nTrain Accuracy: {np.mean(train_accs):.3f} ± {np.std(train_accs):.3f}")
+print(f"  Range: {np.min(train_accs):.3f} - {np.max(train_accs):.3f}")
+print(f"\nVal Accuracy:   {np.mean(val_accs):.3f} ± {np.std(val_accs):.3f}")
+print(f"  Range: {np.min(val_accs):.3f} - {np.max(val_accs):.3f}")
+print(f"\nTrain Loss:     {np.mean(train_losses):.4f} ± {np.std(train_losses):.4f}")
+print(f"Val Loss:       {np.mean(val_losses):.4f} ± {np.std(val_losses):.4f}")
 
-correct_per_class = [0, 0, 0]
-total_per_class = [0, 0, 0]
-overall_correct = 0
-overall_total = 0
-val_preds = []
-val_labels = []
+print(f"\nPer-Fold Results:")
+print(f"{'Fold':<6} {'Train Acc':<12} {'Val Acc':<12}")
+print(f"{'-'*30}")
+for i, fold_num in enumerate(fold_results['fold']):
+    print(f"{fold_num:<6} {fold_results['train_acc'][i]:<12.3f} {fold_results['val_acc'][i]:<12.3f}")
 
-with torch.no_grad():
-    for anions_b, ligands_b, solvents_b, labels_b in val_loader:
-        anions_b = anions_b.to(device)
-        ligands_b = ligands_b.to(device)
-        solvents_b = solvents_b.to(device)
-        labels_b = labels_b.to(device)
-        
-        logits = model(anions_b, ligands_b, solvents_b)
-        preds = logits.argmax(dim=1)
-        
-        # Store for confusion matrix
-        val_preds.extend(preds.cpu().numpy())
-        val_labels.extend(labels_b.cpu().numpy())
-        
-        # Overall accuracy
-        overall_correct += (preds == labels_b).sum().item()
-        overall_total += labels_b.size(0)
-        
-        # Per-class accuracy
-        for class_idx in range(3):
-            class_mask = labels_b == class_idx
-            if class_mask.sum() > 0:
-                class_correct = (preds[class_mask] == labels_b[class_mask]).sum().item()
-                correct_per_class[class_idx] += class_correct
-                total_per_class[class_idx] += class_mask.sum().item()
+# Aggregate confusion matrices
+print(f"\n{'='*80}")
+print("AGGREGATED CONFUSION MATRICES ACROSS ALL FOLDS")
+print(f"{'='*80}")
 
-print(f"\nOverall Accuracy: {overall_correct/overall_total:.3f}")
-print("\nPer-class Accuracy:")
-for class_idx in range(3):
-    if total_per_class[class_idx] > 0:
-        class_acc = correct_per_class[class_idx] / total_per_class[class_idx]
-        print(f"  {label_names[class_idx]:10s}: {class_acc:.3f} ({correct_per_class[class_idx]}/{total_per_class[class_idx]})")
-    else:
-        print(f"  {label_names[class_idx]:10s}: No samples")
+all_val_preds = []
+all_val_labels = []
+all_train_preds = []
+all_train_labels = []
 
-# Confusion Matrix (Validation)
-print("\nConfusion Matrix (Validation Set):")
-val_cm = confusion_matrix(val_labels, val_preds, labels=[0, 1, 2])
+for fold, (train_idx, val_idx) in enumerate(skf.split(all_triplets, all_labels)):
+    fold_val_triplets = [all_triplets[i] for i in val_idx]
+    fold_val_labels = [all_labels[i] for i in val_idx]
+    fold_train_triplets = [all_triplets[i] for i in train_idx]
+    fold_train_labels = [all_labels[i] for i in train_idx]
+    
+    val_dataset = TripletDataset(fold_val_triplets, fold_val_labels)
+    train_dataset = TripletDataset(fold_train_triplets, fold_train_labels)
+    
+    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_triplets)
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=False, collate_fn=collate_triplets)
+    
+    model.load_state_dict(torch.load(f'best_model_fold{fold}.pth', map_location=device))
+    model.eval()
+    
+    # Val predictions
+    with torch.no_grad():
+        for anions_b, ligands_b, solvents_b, labels_b in val_loader:
+            anions_b = anions_b.to(device)
+            ligands_b = ligands_b.to(device)
+            solvents_b = solvents_b.to(device)
+            logits = model(anions_b, ligands_b, solvents_b)
+            preds = logits.argmax(dim=1)
+            all_val_preds.extend(preds.cpu().numpy())
+            all_val_labels.extend(labels_b.numpy())
+    
+    # Train predictions
+    with torch.no_grad():
+        for anions_b, ligands_b, solvents_b, labels_b in train_loader:
+            anions_b = anions_b.to(device)
+            ligands_b = ligands_b.to(device)
+            solvents_b = solvents_b.to(device)
+            logits = model(anions_b, ligands_b, solvents_b)
+            preds = logits.argmax(dim=1)
+            all_train_preds.extend(preds.cpu().numpy())
+            all_train_labels.extend(labels_b.numpy())
+
+# Aggregated validation confusion matrix
+agg_val_cm = confusion_matrix(all_val_labels, all_val_preds, labels=[0, 1, 2])
+print("\nAggregated Validation Confusion Matrix:")
 print(f"{'':15} Pred_no  Pred_slightly  Pred_yes")
 for i, class_name in enumerate(['no', 'slightly', 'yes']):
-    print(f"True_{class_name:8s}:  {val_cm[i, 0]:5d}    {val_cm[i, 1]:5d}        {val_cm[i, 2]:5d}")
+    print(f"True_{class_name:8s}:  {agg_val_cm[i, 0]:5d}    {agg_val_cm[i, 1]:5d}        {agg_val_cm[i, 2]:5d}")
 
-print("\nClassification Report (Validation Set):")
-print(classification_report(val_labels, val_preds, target_names=['no', 'slightly', 'yes'], digits=3))
+# Plot aggregated validation confusion matrix
+plt.figure(figsize=(6,5))
+sns.heatmap(agg_val_cm, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=['no', 'slightly', 'yes'], 
+            yticklabels=['no', 'slightly', 'yes'])
+plt.title('Aggregated Confusion Matrix (Validation Set - All Folds)')
+plt.xlabel('Predicted label')
+plt.ylabel('True label')
+plt.tight_layout()
+plt.savefig('cv_confusion_matrix_validation.png', dpi=150)
+plt.show()
 
-# Also evaluate on training set for comparison
-print("\n" + "="*80)
-print("TRAINING SET RESULTS (for reference)")
-print("="*80)
-
-correct_per_class = [0, 0, 0]
-total_per_class = [0, 0, 0]
-overall_correct = 0
-overall_total = 0
-train_preds = []
-train_labels = []
-
-with torch.no_grad():
-    for anions_b, ligands_b, solvents_b, labels_b in train_loader:
-        anions_b = anions_b.to(device)
-        ligands_b = ligands_b.to(device)
-        solvents_b = solvents_b.to(device)
-        labels_b = labels_b.to(device)
-        
-        logits = model(anions_b, ligands_b, solvents_b)
-        preds = logits.argmax(dim=1)
-        
-        # Store for confusion matrix
-        train_preds.extend(preds.cpu().numpy())
-        train_labels.extend(labels_b.cpu().numpy())
-        
-        # Overall accuracy
-        overall_correct += (preds == labels_b).sum().item()
-        overall_total += labels_b.size(0)
-        
-        # Per-class accuracy
-        for class_idx in range(3):
-            class_mask = labels_b == class_idx
-            if class_mask.sum() > 0:
-                class_correct = (preds[class_mask] == labels_b[class_mask]).sum().item()
-                correct_per_class[class_idx] += class_correct
-                total_per_class[class_idx] += class_mask.sum().item()
-
-print(f"\nOverall Accuracy: {overall_correct/overall_total:.3f}")
-print("\nPer-class Accuracy:")
-for class_idx in range(3):
-    if total_per_class[class_idx] > 0:
-        class_acc = correct_per_class[class_idx] / total_per_class[class_idx]
-        print(f"  {label_names[class_idx]:10s}: {class_acc:.3f} ({correct_per_class[class_idx]}/{total_per_class[class_idx]})")
-    else:
-        print(f"  {label_names[class_idx]:10s}: No samples")
-
-# Confusion Matrix (Training)
-print("\nConfusion Matrix (Training Set):")
-train_cm = confusion_matrix(train_labels, train_preds, labels=[0, 1, 2])
+# Aggregated training confusion matrix
+agg_train_cm = confusion_matrix(all_train_labels, all_train_preds, labels=[0, 1, 2])
+print("\nAggregated Training Confusion Matrix:")
 print(f"{'':15} Pred_no  Pred_slightly  Pred_yes")
 for i, class_name in enumerate(['no', 'slightly', 'yes']):
-    print(f"True_{class_name:8s}:  {train_cm[i, 0]:5d}    {train_cm[i, 1]:5d}        {train_cm[i, 2]:5d}")
+    print(f"True_{class_name:8s}:  {agg_train_cm[i, 0]:5d}    {agg_train_cm[i, 1]:5d}        {agg_train_cm[i, 2]:5d}")
 
-print("\nClassification Report (Training Set):")
-print(classification_report(train_labels, train_preds, target_names=['no', 'slightly', 'yes'], digits=3))
+# Plot aggregated training confusion matrix
+plt.figure(figsize=(6,5))
+sns.heatmap(agg_train_cm, annot=True, fmt='d', cmap='Greens',
+            xticklabels=['no', 'slightly', 'yes'],
+            yticklabels=['no', 'slightly', 'yes'])
+plt.title('Aggregated Confusion Matrix (Training Set - All Folds)')
+plt.xlabel('Predicted label')
+plt.ylabel('True label')
+plt.tight_layout()
+plt.savefig('cv_confusion_matrix_training.png', dpi=150)
+plt.show()
+
+# Classification reports
+print("\n" + "="*80)
+print("AGGREGATED CLASSIFICATION REPORTS")
+print("="*80)
+
+print("\nValidation Classification Report:")
+print(classification_report(all_val_labels, all_val_preds, 
+                          target_names=['no', 'slightly', 'yes'], digits=3))
+
+print("\nTraining Classification Report:")
+print(classification_report(all_train_labels, all_train_preds,
+                          target_names=['no', 'slightly', 'yes'], digits=3))
 
 print("\n" + "="*80)
+print("✓ K-Fold Cross-Validation Completed!")
+print(f"Best model weights saved as: best_model_fold0.pth to best_model_fold{n_splits-1}.pth")
+print("="*80)
