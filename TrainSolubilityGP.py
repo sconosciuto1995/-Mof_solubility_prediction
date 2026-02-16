@@ -12,7 +12,7 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Batch
 import matplotlib.pyplot as plt
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold
 
 from GnnClass2 import CombinedModel, FeatureExtractor, ExactGPLayer
 from helpers import load_solubility_excel
@@ -110,7 +110,9 @@ if len(all_triplets) == 0:
 # =============================================================================
 
 n_splits = 5
-kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+# Convert continuous labels back to discrete for stratification {0.0, 0.5, 1.0} -> {0, 1, 2}
+discrete_labels = [int(label * 2) for label in all_labels]
+skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
 # Store results for each fold
 gp_results = {
@@ -133,7 +135,7 @@ edgefeat_num = first_triplet[0].edge_attr.shape[-1]
 # K-FOLD GP TRAINING LOOP
 # ============================================================================
 
-for fold, (train_idx, val_idx) in enumerate(kf.split(all_triplets)):
+for fold, (train_idx, val_idx) in enumerate(skf.split(all_triplets, discrete_labels)):
     print(f"{'='*80}")
     print(f"GP FOLD {fold+1}/{n_splits}")
     print(f"{'='*80}")
@@ -354,7 +356,7 @@ print(f"{'='*80}\n")
 all_predictions = []
 all_true_values = []
 
-for fold, (train_idx, val_idx) in enumerate(kf.split(all_triplets)):
+for fold, (train_idx, val_idx) in enumerate(skf.split(all_triplets, discrete_labels)):
     fold_val_triplets = [all_triplets[i] for i in val_idx]
     fold_val_labels = [all_labels[i] for i in val_idx]
     fold_val_dataset = TripletDataset(fold_val_triplets, fold_val_labels)
