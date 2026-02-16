@@ -11,7 +11,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Batch
 import numpy as np
-from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+from sklearn.preprocessing import label_binarize
 from sklearn.model_selection import StratifiedKFold
 
 # Ajout pour les plots seaborn
@@ -161,7 +162,11 @@ fold_results = {
     'train_loss': [],
     'val_loss': [],
     'val_confusion_matrices': [],
-    'train_confusion_matrices': []
+    'train_confusion_matrices': [],
+    'train_losses_per_epoch': [],  # New: list of lists for each fold
+    'val_losses_per_epoch': [],    # New
+    'train_accs_per_epoch': [],    # New
+    'val_accs_per_epoch': []       # New
 }
 
 print(f"Starting {n_splits}-Fold Stratified Cross-Validation...")
@@ -237,6 +242,12 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(all_triplets, all_labels))
     
     print(f"\nTraining fold {fold+1}...")
     
+    # Initialize per-epoch tracking
+    fold_train_losses = []
+    fold_val_losses = []
+    fold_train_accs = []
+    fold_val_accs = []
+    
     for epoch in range(epochs):
         # ========== TRAINING ==========
         model.train()
@@ -263,6 +274,10 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(all_triplets, all_labels))
 
         avg_train_loss = train_loss / len(train_dataset)
         train_acc = train_correct / train_total
+        
+        # Store per-epoch data
+        fold_train_losses.append(avg_train_loss)
+        fold_train_accs.append(train_acc)
 
         # ========== VALIDATION ==========
         model.eval()
@@ -287,6 +302,10 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(all_triplets, all_labels))
         
         avg_val_loss = val_loss / len(val_dataset)
         val_acc = val_correct / val_total
+        
+        # Store per-epoch data
+        fold_val_losses.append(avg_val_loss)
+        fold_val_accs.append(val_acc)
         
         # Early stopping
         if val_acc > best_val_acc:
@@ -365,6 +384,10 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(all_triplets, all_labels))
     fold_results['val_loss'].append(avg_val_loss)
     fold_results['val_confusion_matrices'].append(val_cm)
     fold_results['train_confusion_matrices'].append(train_cm)
+    fold_results['train_losses_per_epoch'].append(fold_train_losses)
+    fold_results['val_losses_per_epoch'].append(fold_val_losses)
+    fold_results['train_accs_per_epoch'].append(fold_train_accs)
+    fold_results['val_accs_per_epoch'].append(fold_val_accs)
     
     print(f"  Train Accuracy: {train_acc_final:.3f}")
     print(f"  Val Accuracy:   {val_acc_final:.3f}")
@@ -479,6 +502,118 @@ plt.xlabel('Predicted label')
 plt.ylabel('True label')
 plt.tight_layout()
 plt.savefig('cv_confusion_matrix_training.png', dpi=150)
+plt.show()
+
+# ============================================================================
+# ADDITIONAL PLOTS FOR PRESENTATION
+# ============================================================================
+
+# 1. Training Loss and Accuracy Curves (averaged across folds)
+plt.figure(figsize=(12, 5))
+
+# Loss plot
+plt.subplot(1, 2, 1)
+for fold in range(n_splits):
+    epochs_range = range(1, len(fold_results['train_losses_per_epoch'][fold]) + 1)
+    plt.plot(epochs_range, fold_results['train_losses_per_epoch'][fold], label=f'Fold {fold+1} Train', alpha=0.7)
+    plt.plot(epochs_range, fold_results['val_losses_per_epoch'][fold], label=f'Fold {fold+1} Val', linestyle='--', alpha=0.7)
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Validation Loss per Fold')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.grid(True)
+
+# Accuracy plot
+plt.subplot(1, 2, 2)
+for fold in range(n_splits):
+    epochs_range = range(1, len(fold_results['train_accs_per_epoch'][fold]) + 1)
+    plt.plot(epochs_range, fold_results['train_accs_per_epoch'][fold], label=f'Fold {fold+1} Train', alpha=0.7)
+    plt.plot(epochs_range, fold_results['val_accs_per_epoch'][fold], label=f'Fold {fold+1} Val', linestyle='--', alpha=0.7)
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.title('Training and Validation Accuracy per Fold')
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.grid(True)
+
+plt.tight_layout()
+plt.savefig('training_curves_per_fold.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# 2. Per-Fold Accuracies Bar Plot
+plt.figure(figsize=(8, 5))
+folds = fold_results['fold']
+train_accs = fold_results['train_acc']
+val_accs = fold_results['val_acc']
+x = np.arange(len(folds))
+width = 0.35
+plt.bar(x - width/2, train_accs, width, label='Train Accuracy', alpha=0.8)
+plt.bar(x + width/2, val_accs, width, label='Val Accuracy', alpha=0.8)
+plt.xlabel('Fold')
+plt.ylabel('Accuracy')
+plt.title('Accuracy per Fold')
+plt.xticks(x, folds)
+plt.legend()
+plt.grid(True, axis='y')
+plt.tight_layout()
+plt.savefig('per_fold_accuracies.png', dpi=150)
+plt.show()
+
+# 3. ROC Curves for Multi-Class (One-vs-Rest)
+# Convert labels to binary for each class
+from sklearn.preprocessing import label_binarize
+classes = [0, 1, 2]
+class_names = ['no', 'slightly', 'yes']
+y_test_bin = label_binarize(all_val_labels, classes=classes)
+y_score = []  # Need probabilities
+
+# Get probabilities for validation set
+model.load_state_dict(torch.load('best_model_fold0.pth', map_location=device))  # Use first fold model for simplicity
+model.eval()
+val_probs = []
+with torch.no_grad():
+    for anions_b, ligands_b, solvents_b, labels_b in DataLoader(TripletDataset(all_triplets, all_labels), batch_size=4, shuffle=False, collate_fn=collate_triplets):
+        anions_b = anions_b.to(device)
+        ligands_b = ligands_b.to(device)
+        solvents_b = solvents_b.to(device)
+        logits = model(anions_b, ligands_b, solvents_b)
+        probs = F.softmax(logits, dim=1)
+        val_probs.extend(probs.cpu().numpy())
+val_probs = np.array(val_probs)
+
+# Compute ROC curve and ROC area for each class
+fpr = dict()
+tpr = dict()
+roc_auc = dict()
+for i in range(len(classes)):
+    fpr[i], tpr[i], _ = roc_curve(y_test_bin[:, i], val_probs[:, i])
+    roc_auc[i] = auc(fpr[i], tpr[i])
+
+# Plot ROC curves
+plt.figure(figsize=(8, 6))
+colors = ['blue', 'red', 'green']
+for i, color in zip(range(len(classes)), colors):
+    plt.plot(fpr[i], tpr[i], color=color, lw=2,
+             label=f'ROC curve of class {class_names[i]} (area = {roc_auc[i]:.2f})')
+plt.plot([0, 1], [0, 1], 'k--', lw=2)
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Multi-Class ROC Curves (One-vs-Rest)')
+plt.legend(loc="lower right")
+plt.grid(True)
+plt.tight_layout()
+plt.savefig('roc_curves.png', dpi=150)
+plt.show()
+
+# 4. Label Distribution Pie Chart
+label_counts = [sum(1 for l in all_labels if l==0), sum(1 for l in all_labels if l==1), sum(1 for l in all_labels if l==2)]
+plt.figure(figsize=(6, 6))
+plt.pie(label_counts, labels=class_names, autopct='%1.1f%%', startangle=90, colors=['lightcoral', 'lightblue', 'lightgreen'])
+plt.title('Label Distribution in Dataset')
+plt.axis('equal')
+plt.tight_layout()
+plt.savefig('label_distribution.png', dpi=150)
 plt.show()
 
 # Classification reports
